@@ -26,30 +26,134 @@ jobs:
           cd work && unzip -q Filza.zip
           echo "Extracted: $(ls Payload/)"
 
-      - name: Remove FilzaApplySandboxExt.dylib (iOS 26 crash fix)
+      - name: Inspect FilzaApplySandboxExt.dylib
         run: |
           DYLIB="work/Payload/Filza.app/Frameworks/FilzaApplySandboxExt.dylib"
+          echo "=== Dylib imports ==="
+          otool -L "$DYLIB" || true
+          echo "=== Exported symbols ==="
+          nm -gU "$DYLIB" 2>/dev/null | head -20 || true
+
+      - name: Patch main binary - make FilzaApplySandboxExt weak load
+        run: |
           BINARY="work/Payload/Filza.app/Filza"
+          echo "=== Current load commands for sandbox dylib ==="
+          otool -L "$BINARY" | grep -i "sandbox\|Sandbox" || true
 
-          echo "== Checking dylib links in main binary =="
-          otool -L "$BINARY" | grep -i "sandbox\|iosnhatt\|libtele" || true
+          python3 << 'PYEOF'
+          import struct, sys, os
 
-          echo "== Removing FilzaApplySandboxExt.dylib =="
-          rm -f "$DYLIB"
-          echo "Removed: FilzaApplySandboxExt.dylib"
+          binary_path = "work/Payload/Filza.app/Filza"
+          target = b"FilzaApplySandboxExt"
 
-          echo "== Patching binary: remove LC_LOAD_DYLIB reference =="
-          install_name_tool -delete_rpath "@executable_path/Frameworks" "$BINARY" 2>/dev/null || true
+          LC_LOAD_DYLIB      = 0x0000000C
+          LC_LOAD_WEAK_DYLIB = 0x80000018
 
-          # Remove hard link to the problematic dylib
-          SANDBOXREF=$(otool -L "$BINARY" | grep -i "FilzaApplySandboxExt" | awk '{print $1}' || true)
-          if [ -n "$SANDBOXREF" ]; then
-            echo "Removing reference: $SANDBOXREF"
-            install_name_tool -change "$SANDBOXREF" "/usr/lib/libSystem.B.dylib" "$BINARY" 2>/dev/null || true
-          fi
+          with open(binary_path, "rb") as f:
+              data = bytearray(f.read())
 
-          echo "== Dylib links after patch =="
-          otool -L "$BINARY" | head -20
+          patched = 0
+          i = 0
+          while i < len(data) - 8:
+              # Find our target string
+              idx = data.find(target, i)
+              if idx == -1:
+                  break
+              # Scan backwards to find LC header (cmd + cmdsize)
+              for back in range(idx, max(idx - 512, 0), -4):
+                  try:
+                      cmd = struct.unpack_from("<I", data, back)[0]
+                      if cmd == LC_LOAD_DYLIB:
+                          old = struct.pack("<I", LC_LOAD_DYLIB)
+                          new = struct.pack("<I", LC_LOAD_WEAK_DYLIB)
+                          data[back:back+4] = new
+                          patched += 1
+                          print(f"[+] Patched LC_LOAD_DYLIB -> LC_LOAD_WEAK_DYLIB at offset {back:#x}")
+                          break
+                  except:
+                      pass
+              i = idx + 1
+
+          if patched == 0:
+              print("[!] No LC_LOAD_DYLIB found for target — binary may be FAT or different arch")
+              # Try FAT binary: scan all slices
+              magic = struct.unpack_from(">I", data, 0)[0]
+              if magic == 0xCAFEBABE:  # FAT
+                  nfat = struct.unpack_from(">I", data, 4)[0]
+                  for s in range(nfat):
+                      off = struct.unpack_from(">I", data, 8 + s*20)[0]
+                      sz  = struct.unpack_from(">I", data, 12 + s*20)[0]
+                      slice_data = data[off:off+sz]
+                      j = 0
+                      while j < len(slice_data) - 8:
+                          idx2 = slice_data.find(target, j)
+                          if idx2 == -1:
+                              break
+                          for back2 in range(idx2, max(idx2 - 512, 0), -4):
+                              try:
+                                  cmd2 = struct.unpack_from("<I", slice_data, back2)[0]
+                                  if cmd2 == LC_LOAD_DYLIB:
+                                      new = struct.pack("<I", LC_LOAD_WEAK_DYLIB)
+                                      data[off+back2:off+back2+4] = new
+                                      patched += 1
+                                      print(f"[+] FAT slice {s}: patched at {off+back2:#x}")
+                                      break
+                              except:
+                                  pass
+                          j = idx2 + 1
+
+          with open(binary_path, "wb") as f:
+              f.write(data)
+
+          print(f"[=] Total patches: {patched}")
+          PYEOF
+
+          echo "=== After patch ==="
+          otool -L "$BINARY" | grep -i "sandbox\|Sandbox" || true
+
+      - name: Patch FilzaApplySandboxExt.dylib - make iosnhatt and libtelettt weak
+        run: |
+          DYLIB="work/Payload/Filza.app/Frameworks/FilzaApplySandboxExt.dylib"
+
+          python3 << 'PYEOF'
+          import struct
+
+          dylib_path = "work/Payload/Filza.app/Frameworks/FilzaApplySandboxExt.dylib"
+          targets = [b"iosnhatt", b"libtelettt"]
+
+          LC_LOAD_DYLIB      = 0x0000000C
+          LC_LOAD_WEAK_DYLIB = 0x80000018
+
+          with open(dylib_path, "rb") as f:
+              data = bytearray(f.read())
+
+          patched = 0
+          for target in targets:
+              i = 0
+              while i < len(data) - 8:
+                  idx = data.find(target, i)
+                  if idx == -1:
+                      break
+                  for back in range(idx, max(idx - 512, 0), -4):
+                      try:
+                          cmd = struct.unpack_from("<I", data, back)[0]
+                          if cmd == LC_LOAD_DYLIB:
+                              data[back:back+4] = struct.pack("<I", LC_LOAD_WEAK_DYLIB)
+                              patched += 1
+                              print(f"[+] {target.decode()}: patched at {back:#x}")
+                              break
+                      except:
+                          pass
+                  i = idx + 1
+
+          with open(dylib_path, "wb") as f:
+              f.write(data)
+
+          print(f"[=] Dylib patches: {patched}")
+          PYEOF
+
+          echo "=== FilzaApplySandboxExt deps after patch ==="
+          otool -L "$DYLIB" || true
 
       - name: Write entitlements
         run: |
@@ -80,10 +184,11 @@ jobs:
           </plist>
           EOF
 
-      - name: Patch binary with ldid
+      - name: Apply ldid entitlements
         run: |
           ldid -Sentitlements.plist "work/Payload/Filza.app/Filza"
-          echo "ldid patch OK"
+          ldid -Sentitlements.plist "work/Payload/Filza.app/Frameworks/FilzaApplySandboxExt.dylib"
+          echo "ldid OK"
 
       - name: Remove old signature
         run: |
@@ -92,32 +197,32 @@ jobs:
 
       - name: Repack IPA
         run: |
-          cd work && zip -qr ../Filza-iOS26-NoSandboxCrash.ipa Payload/
-          cd ..
-          echo "IPA: $(du -sh Filza-iOS26-NoSandboxCrash.ipa | cut -f1)"
+          cd work && zip -qr ../Filza-iOS26-Fixed.ipa Payload/
+          echo "IPA: $(du -sh ../Filza-iOS26-Fixed.ipa | cut -f1)"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Filza-iOS26-NoSandboxCrash
-          path: Filza-iOS26-NoSandboxCrash.ipa
+          name: Filza-iOS26-Fixed
+          path: Filza-iOS26-Fixed.ipa
           retention-days: 30
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "nosandboxcrash-v4.0.1-${{ github.run_number }}"
-          name: "Filza iOS 26 — No Crash Fix Build ${{ github.run_number }}"
+          tag_name: "fixed-v4.0.1-${{ github.run_number }}"
+          name: "Filza iOS 26 — Fixed (No Crash) Build ${{ github.run_number }}"
           body: |
-            ## Filza iOS 26 — Crash Fix
+            ## Filza iOS 26.2.1 — Crash Fix
 
             ### Çfarë u rregullua
-            - U hoq `FilzaApplySandboxExt.dylib` (shkaktonte crash në iOS 26.2.1)
-            - U patch-ua binary kryesor me `install_name_tool`
-            - Entitlements të plota (platform-application, no-sandbox)
+            - `FilzaApplySandboxExt.dylib` mbetet (nevojitet për Apps Manager)
+            - U konvertua nga `LC_LOAD_DYLIB` → `LC_LOAD_WEAK_DYLIB` (nuk crash-on nëse dështon)
+            - `iosnhatt.dylib` dhe `libtelettt.dylib` → weak links brenda dylib-it
+            - Entitlements të plota
 
             ### Instalim
-            1. Shkarko `Filza-iOS26-NoSandboxCrash.ipa`
+            1. Shkarko `Filza-iOS26-Fixed.ipa`
             2. Hap me **ESign** → sinjalo
-            3. Instalo dhe hap Filza
-          files: Filza-iOS26-NoSandboxCrash.ipa
+            3. Instalo dhe hap Filza → Apps Manager
+          files: Filza-iOS26-Fixed.ipa

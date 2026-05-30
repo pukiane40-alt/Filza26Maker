@@ -1,0 +1,102 @@
+name: Patch Filza IPA (Fix Apps Manager)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Extract IPA
+        run: |
+          mkdir -p work/Payload
+          cp "Filza-Jailed-iOS26-Premium.ipa" work/Filza.zip
+          cd work && unzip -q Filza.zip
+          echo "Extracted: $(ls Payload/)"
+
+      - name: Write entitlements
+        run: |
+          cat > entitlements.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>platform-application</key>
+            <true/>
+            <key>com.apple.private.security.no-sandbox</key>
+            <true/>
+            <key>com.apple.private.security.container-required</key>
+            <false/>
+            <key>com.apple.private.MobileInstallation.AllowAllBundles</key>
+            <true/>
+            <key>com.apple.springboard.launchapplications</key>
+            <true/>
+            <key>get-task-allow</key>
+            <true/>
+            <key>application-identifier</key>
+            <string>*</string>
+            <key>keychain-access-groups</key>
+            <array>
+              <string>*</string>
+            </array>
+          </dict>
+          </plist>
+          EOF
+          echo "Entitlements ready"
+
+      - name: Patch binary with ldid
+        run: |
+          BINARY="work/Payload/Filza.app/Filza"
+          echo "Patching: $BINARY"
+          ldid -Sentitlements.plist "$BINARY"
+          echo "Patch OK"
+          ldid -e "$BINARY" | grep -A2 "platform-application\|no-sandbox\|AllowAllBundles" || true
+
+      - name: Remove old signature files
+        run: |
+          rm -rf "work/Payload/Filza.app/_CodeSignature"
+          rm -f  "work/Payload/Filza.app/embedded.mobileprovision"
+
+      - name: Repack IPA
+        run: |
+          cd work
+          zip -qr ../Filza-iOS26-Patched.ipa Payload/
+          cd ..
+          echo "IPA size: $(du -sh Filza-iOS26-Patched.ipa | cut -f1)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Filza-iOS26-Patched
+          path: Filza-iOS26-Patched.ipa
+          retention-days: 30
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "patched-v4.0.1-${{ github.run_number }}"
+          name: "Filza iOS 26 — Patched (Apps Manager Fix) Build ${{ github.run_number }}"
+          body: |
+            ## Filza File Manager — Patched IPA
+
+            ### Fixes
+            - Apps Manager tregon të gjitha apps e instaluara
+            - Entitlements te plota (platform-application, no-sandbox)
+
+            ### Instalim
+            1. Shkarko `Filza-iOS26-Patched.ipa`
+            2. Hap me **ESign** dhe sinjalo me certifikatën tënde
+            3. Instalo dhe hap Filza → Apps Manager
+          files: Filza-iOS26-Patched.ipa

@@ -16,15 +16,40 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install ldid
+      - name: Install tools
         run: brew install ldid
 
       - name: Extract IPA
         run: |
-          mkdir -p work/Payload
+          mkdir -p work
           cp "Filza-Jailed-iOS26-Premium.ipa" work/Filza.zip
           cd work && unzip -q Filza.zip
           echo "Extracted: $(ls Payload/)"
+
+      - name: Remove FilzaApplySandboxExt.dylib (iOS 26 crash fix)
+        run: |
+          DYLIB="work/Payload/Filza.app/Frameworks/FilzaApplySandboxExt.dylib"
+          BINARY="work/Payload/Filza.app/Filza"
+
+          echo "== Checking dylib links in main binary =="
+          otool -L "$BINARY" | grep -i "sandbox\|iosnhatt\|libtele" || true
+
+          echo "== Removing FilzaApplySandboxExt.dylib =="
+          rm -f "$DYLIB"
+          echo "Removed: FilzaApplySandboxExt.dylib"
+
+          echo "== Patching binary: remove LC_LOAD_DYLIB reference =="
+          install_name_tool -delete_rpath "@executable_path/Frameworks" "$BINARY" 2>/dev/null || true
+
+          # Remove hard link to the problematic dylib
+          SANDBOXREF=$(otool -L "$BINARY" | grep -i "FilzaApplySandboxExt" | awk '{print $1}' || true)
+          if [ -n "$SANDBOXREF" ]; then
+            echo "Removing reference: $SANDBOXREF"
+            install_name_tool -change "$SANDBOXREF" "/usr/lib/libSystem.B.dylib" "$BINARY" 2>/dev/null || true
+          fi
+
+          echo "== Dylib links after patch =="
+          otool -L "$BINARY" | head -20
 
       - name: Write entitlements
         run: |
@@ -54,49 +79,45 @@ jobs:
           </dict>
           </plist>
           EOF
-          echo "Entitlements ready"
 
       - name: Patch binary with ldid
         run: |
-          BINARY="work/Payload/Filza.app/Filza"
-          echo "Patching: $BINARY"
-          ldid -Sentitlements.plist "$BINARY"
-          echo "Patch OK"
-          ldid -e "$BINARY" | grep -A2 "platform-application\|no-sandbox\|AllowAllBundles" || true
+          ldid -Sentitlements.plist "work/Payload/Filza.app/Filza"
+          echo "ldid patch OK"
 
-      - name: Remove old signature files
+      - name: Remove old signature
         run: |
           rm -rf "work/Payload/Filza.app/_CodeSignature"
           rm -f  "work/Payload/Filza.app/embedded.mobileprovision"
 
       - name: Repack IPA
         run: |
-          cd work
-          zip -qr ../Filza-iOS26-Patched.ipa Payload/
+          cd work && zip -qr ../Filza-iOS26-NoSandboxCrash.ipa Payload/
           cd ..
-          echo "IPA size: $(du -sh Filza-iOS26-Patched.ipa | cut -f1)"
+          echo "IPA: $(du -sh Filza-iOS26-NoSandboxCrash.ipa | cut -f1)"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Filza-iOS26-Patched
-          path: Filza-iOS26-Patched.ipa
+          name: Filza-iOS26-NoSandboxCrash
+          path: Filza-iOS26-NoSandboxCrash.ipa
           retention-days: 30
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "patched-v4.0.1-${{ github.run_number }}"
-          name: "Filza iOS 26 — Patched (Apps Manager Fix) Build ${{ github.run_number }}"
+          tag_name: "nosandboxcrash-v4.0.1-${{ github.run_number }}"
+          name: "Filza iOS 26 — No Crash Fix Build ${{ github.run_number }}"
           body: |
-            ## Filza File Manager — Patched IPA
+            ## Filza iOS 26 — Crash Fix
 
-            ### Fixes
-            - Apps Manager tregon të gjitha apps e instaluara
-            - Entitlements te plota (platform-application, no-sandbox)
+            ### Çfarë u rregullua
+            - U hoq `FilzaApplySandboxExt.dylib` (shkaktonte crash në iOS 26.2.1)
+            - U patch-ua binary kryesor me `install_name_tool`
+            - Entitlements të plota (platform-application, no-sandbox)
 
             ### Instalim
-            1. Shkarko `Filza-iOS26-Patched.ipa`
-            2. Hap me **ESign** dhe sinjalo me certifikatën tënde
-            3. Instalo dhe hap Filza → Apps Manager
-          files: Filza-iOS26-Patched.ipa
+            1. Shkarko `Filza-iOS26-NoSandboxCrash.ipa`
+            2. Hap me **ESign** → sinjalo
+            3. Instalo dhe hap Filza
+          files: Filza-iOS26-NoSandboxCrash.ipa
